@@ -1,0 +1,265 @@
+import base64
+import logging
+import random
+import urllib
+import json
+from hashlib import sha256
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
+from librespot.proto import Authentication_pb2 as Authentication
+from requests.structures import CaseInsensitiveDict
+from datetime import datetime, timedelta
+import requests
+
+
+class OAuth:
+    logger = logging.getLogger("Librespot:OAuth")
+    OAUTH_PKCE_TOKEN = "OAUTH_PKCE_TOKEN"
+    __spotify_auth = "https://accounts.spotify.com/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&scope=%s"
+    __scopes = ["app-remote-control", "playlist-modify", "playlist-modify-private", "playlist-modify-public", "playlist-read", "playlist-read-collaborative", "playlist-read-private", "streaming", "ugc-image-upload", "user-follow-modify", "user-follow-read", "user-library-modify", "user-library-read", "user-modify", "user-modify-playback-state", "user-modify-private", "user-personalized", "user-read-birthdate", "user-read-currently-playing", "user-read-email", "user-read-play-history", "user-read-playback-position", "user-read-playback-state", "user-read-private", "user-read-recently-played", "user-top-read"]
+    __spotify_token = "https://accounts.spotify.com/api/token"
+    __spotify_token_data = CaseInsensitiveDict({"grant_type": "",
+                                                "client_id": ""})
+    __client_id = ""
+    __redirect_url = ""
+    __code_verifier = ""
+    __code = ""
+    __token = ""
+    __token_expires_at = datetime.now()
+    __refresh_token = ""
+    __server = None
+    __oauth_url_callback = None
+    __success_page_content = None
+    __listen_all_interfaces = False
+
+    def __init__(self, client_id, redirect_url, oauth_url_callback):
+        self.__client_id = client_id
+        self.__redirect_url = redirect_url
+        self.__oauth_url_callback = oauth_url_callback
+    
+    def set_success_page_content(self, content):
+        self.__success_page_content = content
+        return self
+
+    def __generate_generate_code_verifier(self):
+        possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        verifier = ""
+        for i in range(128):
+            verifier += possible[random.randint(0, len(possible) - 1)]
+        return verifier
+
+    def __generate_code_challenge(self, code_verifier):
+        digest = sha256(code_verifier.encode('utf-8')).digest()
+        return base64.urlsafe_b64encode(digest).decode('utf-8').rstrip('=')
+
+    def get_auth_url(self):
+        self.__code_verifier = self.__generate_generate_code_verifier()
+        auth_url = self.__spotify_auth % (self.__client_id, self.__redirect_url, self.__generate_code_challenge(self.__code_verifier), "+".join(self.__scopes))
+        if self.__oauth_url_callback:
+            self.__oauth_url_callback(auth_url)
+        return auth_url
+
+    def set_code(self, code):
+        self.__code = code
+        return self
+
+    def set_scopes(self, scopes):
+        self.__scopes = scopes
+        return self
+
+    def set_listen_all(self, listen_all: bool):
+        self.__listen_all_interfaces = listen_all
+        return self
+
+    def ingest_token_response(self, result):
+        self.__token = result["access_token"]
+        self.__refresh_token = result["refresh_token"]
+        if "expires_in" in result:
+            self.__token_expires_at = datetime.now() + timedelta(seconds=result["expires_in"])
+        elif "expires_at" in result:
+            self.__token_expires_at = datetime.fromtimestamp(result["expires_at"])
+        return self
+
+    def request_token(self):
+        if not self.__code:
+            raise RuntimeError("You need to provide a code before!")
+
+        request_data = self.__spotify_token_data
+        request_data["grant_type"] = "authorization_code"
+        request_data["client_id"] = self.__client_id
+        request_data["redirect_uri"] = self.__redirect_url
+        request_data["code"] = self.__code
+        request_data["code_verifier"] = self.__code_verifier
+
+        response = requests.post(
+            self.__spotify_token,
+            headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
+            data=request_data,
+        )
+        if response.status_code != 200:
+            raise RuntimeError("Received status code %d: %s" % (response.status_code, response.reason))
+        return self.ingest_token_response(response.json())
+
+    def refresh_token(self):
+        if not self.__refresh_token:
+            raise RuntimeError("You need to receive a token before!")
+
+        if self.__token_expires_at > datetime.now():
+            return self
+
+        request_data = self.__spotify_token_data
+        request_data["grant_type"] = "refresh_token"
+        request_data["client_id"] = self.__client_id
+        request_data["refresh_token"] = self.__refresh_token
+
+        response = requests.post(
+            self.__spotify_token,
+            headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
+            data=request_data,
+        )
+        if response.status_code != 200:
+            raise RuntimeError("Received status code %d: %s" % (response.status_code, response.reason))
+        return self.ingest_token_response(response.json())
+
+    def token(self):
+        if not self.__token:
+            raise RuntimeError("You need to request a token bore!")
+
+        self.refresh_token()
+
+        return self.__token
+
+    def save_creds(self, cred_path: str):
+        with open(cred_path, 'w',) as f:
+            json.dump({
+                "client_id": self.__client_id,
+                "access_token": self.__token,
+                "expires_at": self.__token_expires_at.timestamp(),
+                "refresh_token": self.__refresh_token,
+                "type": self.OAUTH_PKCE_TOKEN
+            }, f)
+
+    def get_credentials(self):
+        if not self.__token:
+            raise RuntimeError("You need to request a token bore!")
+        return Authentication.LoginCredentials(
+            typ=Authentication.AuthenticationType.AUTHENTICATION_SPOTIFY_TOKEN,
+            auth_data=self.__token.encode("utf-8")
+        )
+
+    class CallbackServer(HTTPServer):
+        callback_path = None
+
+        def __init__(self, server_address, RequestHandlerClass, callback_path, set_code, success_page_content):
+            self.callback_path = callback_path
+            self.set_code = set_code
+            self.success_page_content = success_page_content
+            super().__init__(server_address, RequestHandlerClass)
+
+    class CallbackRequestHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if(self.path.startswith(self.server.callback_path)):
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                if not query.__contains__("code"):
+                    self.send_response(400)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"Request doesn't contain 'code'")
+                    return
+                self.server.set_code(query.get("code")[0])
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                success_page = self.server.success_page_content or "librespot-python received callback"
+                self.wfile.write(success_page.encode('utf-8'))
+            pass
+
+        # Suppress logging
+        def log_message(self, format, *args) -> None:
+            return
+
+    def __start_server(self):
+        try:
+            self.__server.handle_request()
+        except KeyboardInterrupt:
+            return
+        if not self.__code:
+            self.__start_server()
+
+    def run_callback_server(self):
+        url = urlparse(self.__redirect_url)
+        address = "" if self.__listen_all_interfaces else url.hostname
+        self.__server = self.CallbackServer(
+            (address, url.port),
+            self.CallbackRequestHandler,
+            url.path,
+            self.set_code,
+            self.__success_page_content,
+        )
+        logging.info("OAuth: Waiting for callback on %s", url.hostname + ":" + str(url.port))
+        self.__start_server()
+
+    def flow(self):
+        logging.info("OAuth: Visit in your browser and log in: %s ", self.get_auth_url())
+        self.run_callback_server()
+        self.request_token()
+        return self.get_credentials()
+
+    __spotify_device_auth = "https://accounts.spotify.com/oauth2/device/authorize"
+
+    def device_flow(self, device_code_callback=None, timeout=None):
+        """
+        OAuth 2.0 device authorization flow (RFC 8628), as done by go-librespot.
+
+        No local port or browser on this machine is needed: the user opens the
+        verification URL on any device. device_code_callback(url, user_code,
+        expires_at) is called once the code is issued; by default it is logged.
+        """
+        import time
+        response = requests.post(
+            self.__spotify_device_auth,
+            headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
+            data={"client_id": self.__client_id, "scope": " ".join(self.__scopes)},
+        )
+        if response.status_code != 200:
+            raise RuntimeError("Device authorization failed with status %d: %s" % (response.status_code, response.text))
+        da = response.json()
+        url = da.get("verification_uri_complete") or da["verification_uri"]
+        deadline = time.time() + da.get("expires_in", 300)
+        if timeout is not None:
+            deadline = min(deadline, time.time() + timeout)
+        if device_code_callback:
+            device_code_callback(url, da["user_code"], deadline)
+        else:
+            logging.info("OAuth: visit %s and, if prompted, enter code %s", url, da["user_code"])
+
+        interval = da.get("interval", 5)
+        while time.time() < deadline:
+            time.sleep(interval)
+            response = requests.post(
+                self.__spotify_token,
+                headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": self.__client_id,
+                    "device_code": da["device_code"],
+                },
+            )
+            if response.status_code == 200:
+                self.ingest_token_response(response.json())
+                return self.get_credentials()
+            try:
+                error = response.json().get("error")
+            except ValueError:
+                error = None
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            raise RuntimeError("Device authorization failed: %s" % (error or response.text))
+        raise RuntimeError("Device authorization code expired")
+
+    def __close(self):
+        if self.__server:
+            self.__server.shutdown()
